@@ -14,8 +14,8 @@ VARIABLES D'ENVIRONNEMENT NÉCESSAIRES (à définir sur Railway/Render, jamais e
     TELEGRAM_BOT_TOKEN   -> token donné par @BotFather sur Telegram
     TELEGRAM_CHAT_ID     -> ID de la conversation où recevoir les messages
     TRADING_MODE         -> "paper" (défaut, recommandé) ou "live"
-    BINANCE_API_KEY      -> uniquement nécessaire si TRADING_MODE=live
-    BINANCE_API_SECRET   -> uniquement nécessaire si TRADING_MODE=live
+    KRAKEN_API_KEY       -> uniquement nécessaire si TRADING_MODE=live
+    KRAKEN_API_SECRET    -> uniquement nécessaire si TRADING_MODE=live
 """
 
 import os
@@ -29,18 +29,17 @@ import requests
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SYMBOL = "BTC/USDT"
+SYMBOL = "BTC/USD"
 TIMEFRAME = "1m"
 SHORT_WINDOW = 10
 LONG_WINDOW = 25
 INITIAL_CAPITAL = 1000.0
 FEE_RATE = 0.001
-POLL_SECONDS = 60          # vérifie le marché toutes les 60s
-STATUS_EVERY_N_LOOPS = 60  # envoie un état Telegram toutes les ~60 boucles (~1h)
+POLL_SECONDS = 60
+STATUS_EVERY_N_LOOPS = 60
 
-# Garde-fous de sécurité (actifs même en mode live)
-MAX_POSITION_PCT = 0.95     # jamais investir plus de 95% du capital dans un seul trade
-DAILY_LOSS_LIMIT_PCT = -5.0 # si le portefeuille chute de plus de 5% dans la journée, le bot s'arrête
+MAX_POSITION_PCT = 0.95
+DAILY_LOSS_LIMIT_PCT = -5.0
 
 TRADING_MODE = os.environ.get("TRADING_MODE", "paper")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -50,9 +49,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("trading-bot")
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram non configuré, message ignoré : %s", message)
@@ -64,9 +60,6 @@ def send_telegram(message):
         log.error("Échec envoi Telegram : %s", e)
 
 
-# ============================================================
-# ÉTAT DU BOT (persiste en mémoire pendant que le process tourne)
-# ============================================================
 class BotState:
     def __init__(self):
         self.cash = INITIAL_CAPITAL
@@ -90,18 +83,14 @@ class BotState:
 state = BotState()
 
 
-# ============================================================
-# EXCHANGE
-# ============================================================
 def build_exchange():
     if TRADING_MODE == "live":
-        api_key = os.environ.get("BINANCE_API_KEY")
-        api_secret = os.environ.get("BINANCE_API_SECRET")
+        api_key = os.environ.get("KRAKEN_API_KEY")
+        api_secret = os.environ.get("KRAKEN_API_SECRET")
         if not api_key or not api_secret:
-            raise RuntimeError("TRADING_MODE=live mais BINANCE_API_KEY/SECRET manquants")
-        return ccxt.binance({"apiKey": api_key, "secret": api_secret, "enableRateLimit": True})
-    # En mode paper, on utilise quand même ccxt pour LIRE les prix (données publiques, pas besoin de clé)
-    return ccxt.binance({"enableRateLimit": True})
+            raise RuntimeError("TRADING_MODE=live mais KRAKEN_API_KEY/SECRET manquants")
+        return ccxt.kraken({"apiKey": api_key, "secret": api_secret, "enableRateLimit": True})
+    return ccxt.kraken({"enableRateLimit": True})
 
 
 def mean(values):
@@ -113,9 +102,6 @@ def fetch_closes(exchange, symbol, timeframe, limit):
     return [c[4] for c in ohlcv]
 
 
-# ============================================================
-# EXÉCUTION D'ORDRE (paper ou live selon TRADING_MODE)
-# ============================================================
 def execute_buy(exchange, price):
     spend = state.cash * MAX_POSITION_PCT
     fee = spend * FEE_RATE
@@ -132,8 +118,8 @@ def execute_buy(exchange, price):
     state.position = True
 
     send_telegram(
-        f"🟢 ACHAT {SYMBOL}\nPrix : {price:.2f} USDT\nMontant : {amount:.6f}\n"
-        f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USDT"
+        f"🟢 ACHAT {SYMBOL}\nPrix : {price:.2f} USD\nMontant : {amount:.6f}\n"
+        f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USD"
     )
 
 
@@ -151,19 +137,16 @@ def execute_sell(exchange, price):
     state.position = False
 
     send_telegram(
-        f"🔴 VENTE {SYMBOL}\nPrix : {price:.2f} USDT\nMontant : {sold_amount:.6f}\n"
-        f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USDT"
+        f"🔴 VENTE {SYMBOL}\nPrix : {price:.2f} USD\nMontant : {sold_amount:.6f}\n"
+        f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USD"
     )
 
 
-# ============================================================
-# BOUCLE PRINCIPALE
-# ============================================================
 def main_loop():
     exchange = build_exchange()
     send_telegram(
         f"🤖 Bot démarré\nSymbole : {SYMBOL}\nMode : {TRADING_MODE.upper()}\n"
-        f"Capital initial : {INITIAL_CAPITAL} USDT\n"
+        f"Capital initial : {INITIAL_CAPITAL} USD\n"
         f"Stratégie : MA{SHORT_WINDOW}/MA{LONG_WINDOW} crossover"
     )
 
@@ -179,7 +162,6 @@ def main_loop():
 
             state.reset_daily_tracker_if_needed(price)
 
-            # Garde-fou : limite de perte journalière
             current_equity = state.equity(price)
             daily_change_pct = (current_equity / state.day_start_equity - 1) * 100
             if daily_change_pct <= DAILY_LOSS_LIMIT_PCT:
@@ -205,7 +187,7 @@ def main_loop():
                 send_telegram(
                     f"📊 État du bot\nPrix {SYMBOL} : {price:.2f}\n"
                     f"Position : {'LONG' if state.position else 'CASH'}\n"
-                    f"Portefeuille : {current_equity:.2f} USDT ({pnl_pct:+.2f}%)"
+                    f"Portefeuille : {current_equity:.2f} USD ({pnl_pct:+.2f}%)"
                 )
 
             log.info(
@@ -224,15 +206,3 @@ def main_loop():
 if __name__ == "__main__":
     log.info("Démarrage du bot en mode %s", TRADING_MODE.upper())
     main_loop()
-
-
-# ============================================================
-# PASSER EN LIVE (argent réel) — À NE FAIRE QU'APRÈS SEMAINES DE PAPER TRADING
-# ============================================================
-# 1. Crée des clés API sur Binance avec UNIQUEMENT la permission "Enable Trading"
-#    (jamais "Enable Withdrawals" — ça permettrait à un bug ou un vol de clé de vider ton compte)
-# 2. Restreins les clés API par IP si Binance le permet (IP fixe de ton serveur Railway/Render)
-# 3. Définis TRADING_MODE=live, BINANCE_API_KEY et BINANCE_API_SECRET dans les variables
-#    d'environnement du serveur (jamais dans le code, jamais sur GitHub)
-# 4. Commence avec un tout petit capital (ex: 50-100 USDT), pas ton épargne
-# 5. Surveille de près les premiers jours
