@@ -41,13 +41,12 @@ STATUS_EVERY_N_LOOPS = 60
 MAX_POSITION_PCT = 0.95
 DAILY_LOSS_LIMIT_PCT = -5.0
 
-# Poche court terme (scalping) — isolée du capital principal pour limiter le risque
-SCALP_ALLOCATION_PCT = 0.30       # 30% du capital réservé au court terme
-SCALP_MOMENTUM_WINDOW = 5          # regarde le mouvement sur les 5 dernières minutes
-SCALP_ENTRY_THRESHOLD_PCT = 1.5    # déclenche si mouvement > 1.5% dans la fenêtre
-SCALP_TAKE_PROFIT_PCT = 1.0        # sort avec +1% de gain
-SCALP_STOP_LOSS_PCT = 0.5          # sort avec -0.5% de perte
-SCALP_MAX_HOLD_MINUTES = 30        # sort automatiquement après 30 min, peu importe le résultat
+SCALP_ALLOCATION_PCT = 0.30
+SCALP_MOMENTUM_WINDOW = 5
+SCALP_ENTRY_THRESHOLD_PCT = 1.5
+SCALP_TAKE_PROFIT_PCT = 1.0
+SCALP_STOP_LOSS_PCT = 0.5
+SCALP_MAX_HOLD_MINUTES = 30
 
 TRADING_MODE = os.environ.get("TRADING_MODE", "paper")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -70,7 +69,6 @@ def send_telegram(message):
 
 class BotState:
     def __init__(self):
-        # Poche tendance (stratégie principale MA crossover)
         self.cash = INITIAL_CAPITAL * (1 - SCALP_ALLOCATION_PCT)
         self.coins = 0.0
         self.position = False
@@ -79,7 +77,6 @@ class BotState:
         self.loop_count = 0
         self.halted = False
 
-        # Poche court terme (scalping)
         self.scalp_cash = INITIAL_CAPITAL * SCALP_ALLOCATION_PCT
         self.scalp_coins = 0.0
         self.scalp_position = False
@@ -124,9 +121,6 @@ def fetch_closes(exchange, symbol, timeframe, limit):
     return [c[4] for c in ohlcv]
 
 
-# ============================================================
-# ANALYSE DE NEWS (filtre additionnel, pas un signal principal)
-# ============================================================
 POSITIVE_WORDS = [
     "surge", "rally", "bullish", "gain", "adoption", "approval", "breakout",
     "record high", "inflow", "upgrade", "partnership", "institutional buy",
@@ -151,12 +145,21 @@ def fetch_news_sentiment():
         url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories=BTC"
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        articles = data.get("Data", [])[:15]
+
+        raw_articles = data.get("Data") if isinstance(data, dict) else None
+        if not isinstance(raw_articles, list):
+            log.warning("Réponse news inattendue (pas de liste d'articles), sentiment neutre par défaut")
+            NEWS_CACHE["last_fetch"] = now
+            return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
+
+        articles = raw_articles[:15]
 
         score = 0
         headlines = []
         for article in articles:
-            title = article.get("title", "").lower()
+            if not isinstance(article, dict):
+                continue
+            title = str(article.get("title", "")).lower()
             headlines.append(article.get("title", ""))
             for word in POSITIVE_WORDS:
                 if word in title:
@@ -172,7 +175,8 @@ def fetch_news_sentiment():
 
     except Exception as e:
         log.error("Échec récupération news : %s", e)
-        return 0, []
+        NEWS_CACHE["last_fetch"] = now
+        return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
 
 
 def execute_buy(exchange, price):
@@ -213,11 +217,7 @@ def execute_sell(exchange, price):
     )
 
 
-# ============================================================
-# SCALPING (court terme) — poche isolée, cycle rapide entrée/sortie
-# ============================================================
 def check_scalp_opportunity(closes):
-    """Détecte un mouvement de prix rapide sur la fenêtre récente."""
     if len(closes) < SCALP_MOMENTUM_WINDOW + 1:
         return False, 0.0
     past_price = closes[-(SCALP_MOMENTUM_WINDOW + 1)]
@@ -229,9 +229,6 @@ def check_scalp_opportunity(closes):
 
 
 def execute_scalp_buy(price, momentum_pct):
-    # Le scalping reste toujours en simulation (paper), même si TRADING_MODE=live,
-    # tant que cette logique n'a pas été testée en conditions réelles sur plusieurs
-    # semaines. C'est une protection volontaire, pas un oubli.
     spend = state.scalp_cash
     fee = spend * FEE_RATE
     amount = (spend - fee) / price
@@ -250,7 +247,6 @@ def execute_scalp_buy(price, momentum_pct):
 
 
 def check_scalp_exit(price):
-    """Vérifie si une position de scalp doit être fermée (take profit, stop loss, ou délai max)."""
     if not state.scalp_position:
         return None
 
@@ -341,7 +337,6 @@ def main_loop():
             elif not signal_long and state.position:
                 execute_sell(exchange, price)
 
-            # --- Poche court terme (scalping) ---
             if state.scalp_position:
                 exit_reason = check_scalp_exit(price)
                 if exit_reason:
