@@ -71,7 +71,8 @@ STOPLOSS_GUARD_PAUSE_MINUTES = 120      # ...pause les nouveaux achats tendance 
 
 COOLDOWN_MINUTES = 15  # attend 15 min après une vente tendance avant de pouvoir racheter
 
-MIN_VOLATILITY_PCT = 0.3    # écart min (haut-bas) sur la fenêtre LONG_WINDOW pour autoriser un achat tendance
+MIN_VOLATILITY_PCT = 0.15   # écart min (haut-bas) sur la fenêtre LONG_WINDOW pour autoriser un achat tendance
+                              # (ajusté le 24/07 sur la base de relevés réels : ~0.21% en marché calme)
 
 SCALP_ALLOCATION_PCT = 0.30
 SCALP_MOMENTUM_WINDOW = 5
