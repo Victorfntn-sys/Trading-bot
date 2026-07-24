@@ -1,22 +1,28 @@
 """
-Bot de trading crypto avec notifications Telegram et filtre de sentiment news
-==============================================================================
+Bot de trading crypto — persistance d'état, stop-loss, filtre volatilité, journal
+====================================================================================
 
-Conçu pour tourner 24/7 sur un serveur cloud (Railway, Render, etc.)
-Envoie une notification Telegram à chaque trade (et un état périodique).
+Conçu pour tourner 24/7 sur Railway. Envoie des notifications Telegram.
 
 MODE PAR DÉFAUT : PAPER TRADING (simulation, aucun argent réel)
-Pour passer en argent réel, voir la section "PASSER EN LIVE" tout en bas.
-Ne fais JAMAIS ce switch sans avoir observé le bot tourner en paper trading
-pendant plusieurs semaines au minimum.
+Ne fais JAMAIS le switch vers "live" sans avoir observé le bot tourner en
+paper trading pendant plusieurs semaines au minimum.
 
-VARIABLES D'ENVIRONNEMENT NÉCESSAIRES (à définir sur Railway, jamais en dur dans le code) :
+VARIABLES D'ENVIRONNEMENT NÉCESSAIRES :
     TELEGRAM_BOT_TOKEN   -> token donné par @BotFather sur Telegram
     TELEGRAM_CHAT_ID     -> ID de la conversation où recevoir les messages
     TRADING_MODE         -> "paper" (défaut, recommandé) ou "live"
-    ANTHROPIC_API_KEY    -> clé API Anthropic (console.anthropic.com) pour l'analyse de news
+    ANTHROPIC_API_KEY    -> clé API Anthropic pour l'analyse de news
     KRAKEN_API_KEY        -> uniquement nécessaire si TRADING_MODE=live
     KRAKEN_API_SECRET     -> uniquement nécessaire si TRADING_MODE=live
+
+IMPORTANT — PERSISTANCE :
+    Ce bot sauvegarde son état dans /data/state.json et son journal de trades
+    dans /data/trades.json. Pour que ces fichiers survivent aux redéploiements,
+    il FAUT ajouter un Volume sur Railway monté sur le chemin /data
+    (Settings du service -> Volumes -> New Volume -> Mount path: /data).
+    Sans ce volume, le bot fonctionne quand même mais perd son historique à
+    chaque redéploiement (comme avant).
 """
 
 import os
@@ -27,6 +33,9 @@ from datetime import datetime
 
 import ccxt
 import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("trading-bot")
 
 # ============================================================
 # CONFIGURATION
@@ -40,25 +49,30 @@ FEE_RATE = 0.001
 POLL_SECONDS = 60
 STATUS_EVERY_N_LOOPS = 60
 
-MAX_POSITION_PCT = 0.95      # taille maximale investie si la tendance est très forte
-MIN_POSITION_PCT = 0.40      # taille minimale investie si le signal vient tout juste de se déclencher
-TREND_STRENGTH_CAP_PCT = 1.0 # écart MA (%) à partir duquel la tendance est considérée "forte" (position max)
+MAX_POSITION_PCT = 0.95
+MIN_POSITION_PCT = 0.40
+TREND_STRENGTH_CAP_PCT = 1.0
 DAILY_LOSS_LIMIT_PCT = -5.0
 
-# Poche court terme (scalping) — isolée du capital principal pour limiter le risque
-SCALP_ALLOCATION_PCT = 0.30       # 30% du capital réservé au court terme
-SCALP_MOMENTUM_WINDOW = 5          # regarde le mouvement sur les 5 dernières minutes
-SCALP_ENTRY_THRESHOLD_PCT = 1.5    # déclenche si mouvement > 1.5% dans la fenêtre
-SCALP_TAKE_PROFIT_PCT = 1.0        # sort avec +1% de gain
-SCALP_STOP_LOSS_PCT = 0.5          # sort avec -0.5% de perte
-SCALP_MAX_HOLD_MINUTES = 30        # sort automatiquement après 30 min, peu importe le résultat
+TREND_STOP_LOSS_PCT = 3.0   # vente forcée si la position tendance perd 3%, peu importe le signal MA
+
+MIN_VOLATILITY_PCT = 0.3    # écart min (haut-bas) sur la fenêtre LONG_WINDOW pour autoriser un achat tendance
+
+SCALP_ALLOCATION_PCT = 0.30
+SCALP_MOMENTUM_WINDOW = 5
+SCALP_ENTRY_THRESHOLD_PCT = 1.5
+SCALP_TAKE_PROFIT_PCT = 1.0
+SCALP_STOP_LOSS_PCT = 0.5
+SCALP_MAX_HOLD_MINUTES = 30
 
 TRADING_MODE = os.environ.get("TRADING_MODE", "paper")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("trading-bot")
+STATE_FILE = os.environ.get("STATE_FILE_PATH", "/data/state.json")
+TRADES_FILE = os.environ.get("TRADES_FILE_PATH", "/data/trades.json")
+MAX_TRADES_LOGGED = 500
 
 
 def send_telegram(message, max_retries=3):
@@ -84,23 +98,88 @@ def send_telegram(message, max_retries=3):
     log.error("Abandon de l'envoi Telegram après %d tentatives : %s", max_retries, message)
 
 
+# ============================================================
+# PERSISTANCE (état + journal de trades)
+# ============================================================
+def load_json_file(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json_file(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.error("Échec sauvegarde %s : %s", path, e)
+
+
+def log_trade(pocket, side, price, amount, reason=None, pnl_pct=None):
+    trades = load_json_file(TRADES_FILE, [])
+    trades.append({
+        "time": datetime.utcnow().isoformat(),
+        "pocket": pocket,
+        "side": side,
+        "price": price,
+        "amount": amount,
+        "reason": reason,
+        "pnl_pct": pnl_pct,
+    })
+    trades = trades[-MAX_TRADES_LOGGED:]
+    save_json_file(TRADES_FILE, trades)
+
+
+def compute_trade_stats():
+    trades = load_json_file(TRADES_FILE, [])
+    sells = [t for t in trades if t["side"] == "sell" and t.get("pnl_pct") is not None]
+    if not sells:
+        return None
+    wins = [t for t in sells if t["pnl_pct"] > 0]
+    win_rate = len(wins) / len(sells) * 100
+    avg_pnl = sum(t["pnl_pct"] for t in sells) / len(sells)
+    return {"total_trades": len(sells), "win_rate": win_rate, "avg_pnl_pct": avg_pnl}
+
+
+# ============================================================
+# ÉTAT DU BOT
+# ============================================================
 class BotState:
     def __init__(self):
-        # Poche tendance (stratégie principale MA crossover)
-        self.cash = INITIAL_CAPITAL * (1 - SCALP_ALLOCATION_PCT)
-        self.coins = 0.0
-        self.position = False
-        self.day_start_equity = INITIAL_CAPITAL
-        self.day_start_date = datetime.utcnow().date()
-        self.loop_count = 0
-        self.halted = False
-
-        # Poche court terme (scalping)
-        self.scalp_cash = INITIAL_CAPITAL * SCALP_ALLOCATION_PCT
-        self.scalp_coins = 0.0
-        self.scalp_position = False
-        self.scalp_entry_price = None
-        self.scalp_entry_time = None
+        saved = load_json_file(STATE_FILE, None)
+        if saved:
+            log.info("État précédent restauré depuis %s", STATE_FILE)
+            self.cash = saved["cash"]
+            self.coins = saved["coins"]
+            self.position = saved["position"]
+            self.entry_price = saved.get("entry_price")
+            self.day_start_equity = saved["day_start_equity"]
+            self.day_start_date = datetime.fromisoformat(saved["day_start_date"]).date()
+            self.loop_count = saved["loop_count"]
+            self.halted = saved["halted"]
+            self.scalp_cash = saved["scalp_cash"]
+            self.scalp_coins = saved["scalp_coins"]
+            self.scalp_position = saved["scalp_position"]
+            self.scalp_entry_price = saved.get("scalp_entry_price")
+            self.scalp_entry_time = saved.get("scalp_entry_time")
+        else:
+            log.info("Aucun état précédent trouvé, démarrage à neuf")
+            self.cash = INITIAL_CAPITAL * (1 - SCALP_ALLOCATION_PCT)
+            self.coins = 0.0
+            self.position = False
+            self.entry_price = None
+            self.day_start_equity = INITIAL_CAPITAL
+            self.day_start_date = datetime.utcnow().date()
+            self.loop_count = 0
+            self.halted = False
+            self.scalp_cash = INITIAL_CAPITAL * SCALP_ALLOCATION_PCT
+            self.scalp_coins = 0.0
+            self.scalp_position = False
+            self.scalp_entry_price = None
+            self.scalp_entry_time = None
 
     def equity(self, price):
         return self.cash + self.coins * price
@@ -116,6 +195,23 @@ class BotState:
         if today != self.day_start_date:
             self.day_start_date = today
             self.day_start_equity = self.total_equity(price)
+
+    def save(self):
+        save_json_file(STATE_FILE, {
+            "cash": self.cash,
+            "coins": self.coins,
+            "position": self.position,
+            "entry_price": self.entry_price,
+            "day_start_equity": self.day_start_equity,
+            "day_start_date": self.day_start_date.isoformat(),
+            "loop_count": self.loop_count,
+            "halted": self.halted,
+            "scalp_cash": self.scalp_cash,
+            "scalp_coins": self.scalp_coins,
+            "scalp_position": self.scalp_position,
+            "scalp_entry_price": self.scalp_entry_price,
+            "scalp_entry_time": self.scalp_entry_time,
+        })
 
 
 state = BotState()
@@ -140,18 +236,25 @@ def fetch_closes(exchange, symbol, timeframe, limit):
     return [c[4] for c in ohlcv]
 
 
-# ============================================================
-# ANALYSE DE NEWS (filtre additionnel, pas un signal principal)
-# ============================================================
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+def compute_volatility_pct(closes, window):
+    recent = closes[-window:]
+    if not recent:
+        return 0.0
+    avg = mean(recent)
+    if avg == 0:
+        return 0.0
+    return (max(recent) - min(recent)) / avg * 100
 
+
+# ============================================================
+# ANALYSE DE NEWS (via Claude)
+# ============================================================
 NEWS_CACHE = {"score": 0, "headlines": [], "last_fetch": 0}
 NEWS_REFRESH_SECONDS = 900
 NEWS_NEGATIVE_THRESHOLD = -3
 
 
 def fetch_raw_headlines():
-    """Récupère les derniers titres de news crypto (sans les analyser)."""
     try:
         url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories=BTC"
         resp = requests.get(url, timeout=10)
@@ -169,7 +272,6 @@ def fetch_raw_headlines():
 
 
 def analyze_sentiment_with_claude(headlines):
-    """Envoie les titres à Claude pour une vraie analyse de sentiment contextuelle."""
     if not ANTHROPIC_API_KEY or not headlines:
         return None
 
@@ -200,7 +302,6 @@ def analyze_sentiment_with_claude(headlines):
         resp.raise_for_status()
         data = resp.json()
         text = data["content"][0]["text"].strip()
-        # Nettoyage au cas où le modèle ajoute des balises markdown malgré la consigne
         text = text.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(text)
         return int(parsed.get("score", 0)), parsed.get("raison", "")
@@ -221,7 +322,6 @@ def fetch_news_sentiment():
 
     result = analyze_sentiment_with_claude(headlines)
     if result is None:
-        log.warning("Analyse Claude indisponible, sentiment neutre conservé")
         NEWS_CACHE["last_fetch"] = now
         return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
 
@@ -233,8 +333,10 @@ def fetch_news_sentiment():
     return score, headlines[:5]
 
 
+# ============================================================
+# EXÉCUTION — POCHE TENDANCE
+# ============================================================
 def compute_position_pct(trend_strength_pct):
-    """Plus l'écart entre MA10 et MA25 est grand, plus la position est importante."""
     ratio = min(1.0, max(0.0, trend_strength_pct / TREND_STRENGTH_CAP_PCT))
     return MIN_POSITION_PCT + (MAX_POSITION_PCT - MIN_POSITION_PCT) * ratio
 
@@ -252,6 +354,9 @@ def execute_buy(exchange, price, trend_strength_pct):
     state.coins = amount
     state.cash -= spend
     state.position = True
+    state.entry_price = price
+    state.save()
+    log_trade("trend", "buy", price, amount)
 
     send_telegram(
         f"🟢 ACHAT {SYMBOL}\nPrix : {price:.2f} USD\nMontant : {amount:.6f}\n"
@@ -260,9 +365,10 @@ def execute_buy(exchange, price, trend_strength_pct):
     )
 
 
-def execute_sell(exchange, price):
+def execute_sell(exchange, price, reason="signal"):
     proceeds = state.coins * price
     fee = proceeds * FEE_RATE
+    pnl_pct = ((price - state.entry_price) / state.entry_price * 100) if state.entry_price else None
 
     if TRADING_MODE == "live":
         order = exchange.create_market_sell_order(SYMBOL, state.coins)
@@ -272,18 +378,23 @@ def execute_sell(exchange, price):
     sold_amount = state.coins
     state.coins = 0.0
     state.position = False
+    state.entry_price = None
+    state.save()
+    log_trade("trend", "sell", price, sold_amount, reason=reason, pnl_pct=pnl_pct)
 
+    reason_label = "🛑 Stop-loss déclenché" if reason == "stop_loss" else "Signal de sortie"
+    pnl_text = f"\nRésultat : {pnl_pct:+.2f}%" if pnl_pct is not None else ""
     send_telegram(
-        f"🔴 VENTE {SYMBOL} (tendance)\nPrix : {price:.2f} USD\nMontant : {sold_amount:.6f}\n"
+        f"🔴 VENTE {SYMBOL} (tendance)\n{reason_label}\nPrix : {price:.2f} USD\n"
+        f"Montant : {sold_amount:.6f}{pnl_text}\n"
         f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USD"
     )
 
 
 # ============================================================
-# SCALPING (court terme) — poche isolée, cycle rapide entrée/sortie
+# EXÉCUTION — POCHE SCALP
 # ============================================================
 def check_scalp_opportunity(closes):
-    """Détecte un mouvement de prix rapide sur la fenêtre récente."""
     if len(closes) < SCALP_MOMENTUM_WINDOW + 1:
         return False, 0.0
     past_price = closes[-(SCALP_MOMENTUM_WINDOW + 1)]
@@ -295,9 +406,6 @@ def check_scalp_opportunity(closes):
 
 
 def execute_scalp_buy(price, momentum_pct):
-    # Le scalping reste toujours en simulation (paper), même si TRADING_MODE=live,
-    # tant que cette logique n'a pas été testée en conditions réelles sur plusieurs
-    # semaines. C'est une protection volontaire, pas un oubli.
     spend = state.scalp_cash
     fee = spend * FEE_RATE
     amount = (spend - fee) / price
@@ -307,6 +415,8 @@ def execute_scalp_buy(price, momentum_pct):
     state.scalp_position = True
     state.scalp_entry_price = price
     state.scalp_entry_time = time.time()
+    state.save()
+    log_trade("scalp", "buy", price, amount)
 
     send_telegram(
         f"⚡ ACHAT COURT TERME {SYMBOL}\nPrix : {price:.2f} USD\n"
@@ -316,10 +426,8 @@ def execute_scalp_buy(price, momentum_pct):
 
 
 def check_scalp_exit(price):
-    """Vérifie si une position de scalp doit être fermée (take profit, stop loss, ou délai max)."""
     if not state.scalp_position:
         return None
-
     change_pct = (price - state.scalp_entry_price) / state.scalp_entry_price * 100
     held_minutes = (time.time() - state.scalp_entry_time) / 60
 
@@ -338,10 +446,13 @@ def execute_scalp_sell(price, reason):
     change_pct = (price - state.scalp_entry_price) / state.scalp_entry_price * 100
 
     state.scalp_cash = proceeds - fee
+    sold_amount = state.scalp_coins
     state.scalp_coins = 0.0
     state.scalp_position = False
     state.scalp_entry_price = None
     state.scalp_entry_time = None
+    state.save()
+    log_trade("scalp", "sell", price, sold_amount, reason=reason, pnl_pct=change_pct)
 
     reason_labels = {
         "take_profit": "🎯 Objectif atteint",
@@ -355,14 +466,22 @@ def execute_scalp_sell(price, reason):
     )
 
 
+# ============================================================
+# BOUCLE PRINCIPALE
+# ============================================================
 def main_loop():
     exchange = build_exchange()
+
+    if not os.path.isdir("/data"):
+        log.warning(
+            "Le dossier /data n'existe pas : ajoute un Volume Railway monté sur "
+            "/data pour que l'état survive aux redéploiements."
+        )
+
     send_telegram(
-        f"🤖 Bot démarré\nSymbole : {SYMBOL}\nMode : {TRADING_MODE.upper()}\n"
-        f"Capital initial : {INITIAL_CAPITAL} USD\n"
-        f"Poche tendance (MA{SHORT_WINDOW}/MA{LONG_WINDOW}) : {INITIAL_CAPITAL * (1 - SCALP_ALLOCATION_PCT):.0f} USD\n"
-        f"Poche court terme (scalp) : {INITIAL_CAPITAL * SCALP_ALLOCATION_PCT:.0f} USD\n"
-        f"Filtre news actif"
+        f"🤖 Bot démarré (ou redémarré)\nSymbole : {SYMBOL}\nMode : {TRADING_MODE.upper()}\n"
+        f"Position tendance : {'LONG' if state.position else 'CASH'} | Scalp : {'LONG' if state.scalp_position else 'CASH'}\n"
+        f"Filtre news actif | Stop-loss tendance : -{TREND_STOP_LOSS_PCT}%"
     )
 
     while True:
@@ -381,32 +500,41 @@ def main_loop():
             daily_change_pct = (current_total_equity / state.day_start_equity - 1) * 100
             if daily_change_pct <= DAILY_LOSS_LIMIT_PCT:
                 state.halted = True
+                state.save()
                 send_telegram(
                     f"⚠️ ARRÊT AUTOMATIQUE\nPerte journalière : {daily_change_pct:.2f}%\n"
                     f"Le bot est mis en pause. Intervention manuelle nécessaire pour relancer."
                 )
                 continue
 
+            # --- Stop-loss tendance, vérifié en priorité ---
+            if state.position and state.entry_price:
+                change_pct = (price - state.entry_price) / state.entry_price * 100
+                if change_pct <= -TREND_STOP_LOSS_PCT:
+                    execute_sell(exchange, price, reason="stop_loss")
+
             short_ma = mean(closes[-SHORT_WINDOW:])
             long_ma = mean(closes[-LONG_WINDOW:])
             signal_long = short_ma > long_ma
             trend_strength_pct = (short_ma - long_ma) / long_ma * 100 if long_ma else 0
+            volatility_pct = compute_volatility_pct(closes, LONG_WINDOW)
 
             news_score, headlines = fetch_news_sentiment()
             news_blocks_buy = news_score <= NEWS_NEGATIVE_THRESHOLD
+            volatility_blocks_buy = volatility_pct < MIN_VOLATILITY_PCT
 
             if signal_long and not state.position:
                 if news_blocks_buy:
-                    log.info("Achat bloqué par le filtre news (score=%d)", news_score)
-                    send_telegram(
-                        f"⏸️ Achat bloqué par les news\nScore sentiment : {news_score}\n"
-                        f"Le signal technique était à l'achat, mais le climat des news "
-                        f"est trop négatif pour agir."
+                    log.info("Achat tendance bloqué par les news (score=%d)", news_score)
+                elif volatility_blocks_buy:
+                    log.info(
+                        "Achat tendance bloqué par le filtre volatilité (%.2f%% < %.2f%%)",
+                        volatility_pct, MIN_VOLATILITY_PCT,
                     )
                 else:
                     execute_buy(exchange, price, trend_strength_pct)
             elif not signal_long and state.position:
-                execute_sell(exchange, price)
+                execute_sell(exchange, price, reason="signal")
 
             # --- Poche court terme (scalping) ---
             if state.scalp_position:
@@ -419,22 +547,31 @@ def main_loop():
                     execute_scalp_buy(price, momentum_pct)
 
             state.loop_count += 1
+            state.save()
+
             if state.loop_count % STATUS_EVERY_N_LOOPS == 0:
                 pnl_pct = (current_total_equity / INITIAL_CAPITAL - 1) * 100
+                stats = compute_trade_stats()
+                stats_text = (
+                    f"\nHistorique : {stats['total_trades']} trades clôturés, "
+                    f"{stats['win_rate']:.0f}% de réussite, {stats['avg_pnl_pct']:+.2f}% en moyenne"
+                    if stats else "\nHistorique : pas encore assez de trades clôturés"
+                )
                 send_telegram(
                     f"📊 État du bot\nPrix {SYMBOL} : {price:.2f}\n"
                     f"Position tendance : {'LONG' if state.position else 'CASH'}\n"
                     f"Position scalp : {'LONG' if state.scalp_position else 'CASH'}\n"
                     f"Portefeuille total : {current_total_equity:.2f} USD ({pnl_pct:+.2f}%)\n"
-                    f"Sentiment news : {news_score}"
+                    f"Sentiment news : {news_score} | Volatilité : {volatility_pct:.2f}%"
+                    f"{stats_text}"
                 )
 
             log.info(
-                "Prix=%.2f MA%d=%.2f MA%d=%.2f Tendance=%s Scalp=%s Equity=%.2f News=%d",
+                "Prix=%.2f MA%d=%.2f MA%d=%.2f Tendance=%s Scalp=%s Equity=%.2f News=%d Vol=%.2f%%",
                 price, SHORT_WINDOW, short_ma, LONG_WINDOW, long_ma,
                 "LONG" if state.position else "CASH",
                 "LONG" if state.scalp_position else "CASH",
-                current_total_equity, news_score,
+                current_total_equity, news_score, volatility_pct,
             )
 
         except Exception as e:
@@ -453,9 +590,8 @@ if __name__ == "__main__":
 # PASSER EN LIVE (argent réel) — À NE FAIRE QU'APRÈS SEMAINES DE PAPER TRADING
 # ============================================================
 # 1. Crée des clés API sur Kraken avec UNIQUEMENT la permission de trading
-#    (jamais de permission de retrait — ça permettrait à un bug ou un vol
-#    de clé de vider ton compte)
+#    (jamais de permission de retrait)
 # 2. Définis TRADING_MODE=live, KRAKEN_API_KEY et KRAKEN_API_SECRET dans
-#    les variables d'environnement du serveur (jamais dans le code)
+#    les variables d'environnement du serveur
 # 3. Commence avec un tout petit capital, pas ton épargne
 # 4. Surveille de près les premiers jours
