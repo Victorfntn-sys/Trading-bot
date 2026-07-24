@@ -14,12 +14,14 @@ VARIABLES D'ENVIRONNEMENT NÉCESSAIRES (à définir sur Railway, jamais en dur d
     TELEGRAM_BOT_TOKEN   -> token donné par @BotFather sur Telegram
     TELEGRAM_CHAT_ID     -> ID de la conversation où recevoir les messages
     TRADING_MODE         -> "paper" (défaut, recommandé) ou "live"
+    ANTHROPIC_API_KEY    -> clé API Anthropic (console.anthropic.com) pour l'analyse de news
     KRAKEN_API_KEY        -> uniquement nécessaire si TRADING_MODE=live
     KRAKEN_API_SECRET     -> uniquement nécessaire si TRADING_MODE=live
 """
 
 import os
 import time
+import json
 import logging
 from datetime import datetime
 
@@ -41,12 +43,13 @@ STATUS_EVERY_N_LOOPS = 60
 MAX_POSITION_PCT = 0.95
 DAILY_LOSS_LIMIT_PCT = -5.0
 
-SCALP_ALLOCATION_PCT = 0.30
-SCALP_MOMENTUM_WINDOW = 5
-SCALP_ENTRY_THRESHOLD_PCT = 1.5
-SCALP_TAKE_PROFIT_PCT = 1.0
-SCALP_STOP_LOSS_PCT = 0.5
-SCALP_MAX_HOLD_MINUTES = 30
+# Poche court terme (scalping) — isolée du capital principal pour limiter le risque
+SCALP_ALLOCATION_PCT = 0.30       # 30% du capital réservé au court terme
+SCALP_MOMENTUM_WINDOW = 5          # regarde le mouvement sur les 5 dernières minutes
+SCALP_ENTRY_THRESHOLD_PCT = 1.5    # déclenche si mouvement > 1.5% dans la fenêtre
+SCALP_TAKE_PROFIT_PCT = 1.0        # sort avec +1% de gain
+SCALP_STOP_LOSS_PCT = 0.5          # sort avec -0.5% de perte
+SCALP_MAX_HOLD_MINUTES = 30        # sort automatiquement après 30 min, peu importe le résultat
 
 TRADING_MODE = os.environ.get("TRADING_MODE", "paper")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -56,19 +59,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("trading-bot")
 
 
-def send_telegram(message):
+def send_telegram(message, max_retries=3):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram non configuré, message ignoré : %s", message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-    except Exception as e:
-        log.error("Échec envoi Telegram : %s", e)
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10
+            )
+            if resp.status_code == 200:
+                return
+            log.warning(
+                "Envoi Telegram non confirmé (tentative %d/%d, code=%s) : %s",
+                attempt, max_retries, resp.status_code, resp.text[:200],
+            )
+        except Exception as e:
+            log.error("Échec envoi Telegram (tentative %d/%d) : %s", attempt, max_retries, e)
+        if attempt < max_retries:
+            time.sleep(2)
+    log.error("Abandon de l'envoi Telegram après %d tentatives : %s", max_retries, message)
 
 
 class BotState:
     def __init__(self):
+        # Poche tendance (stratégie principale MA crossover)
         self.cash = INITIAL_CAPITAL * (1 - SCALP_ALLOCATION_PCT)
         self.coins = 0.0
         self.position = False
@@ -77,6 +93,7 @@ class BotState:
         self.loop_count = 0
         self.halted = False
 
+        # Poche court terme (scalping)
         self.scalp_cash = INITIAL_CAPITAL * SCALP_ALLOCATION_PCT
         self.scalp_coins = 0.0
         self.scalp_position = False
@@ -121,19 +138,73 @@ def fetch_closes(exchange, symbol, timeframe, limit):
     return [c[4] for c in ohlcv]
 
 
-POSITIVE_WORDS = [
-    "surge", "rally", "bullish", "gain", "adoption", "approval", "breakout",
-    "record high", "inflow", "upgrade", "partnership", "institutional buy",
-]
-NEGATIVE_WORDS = [
-    "crash", "plunge", "bearish", "hack", "exploit", "ban", "lawsuit",
-    "investigation", "sell-off", "selloff", "liquidation", "collapse",
-    "fraud", "scam", "outflow", "regulatory crackdown",
-]
+# ============================================================
+# ANALYSE DE NEWS (filtre additionnel, pas un signal principal)
+# ============================================================
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 NEWS_CACHE = {"score": 0, "headlines": [], "last_fetch": 0}
 NEWS_REFRESH_SECONDS = 900
 NEWS_NEGATIVE_THRESHOLD = -3
+
+
+def fetch_raw_headlines():
+    """Récupère les derniers titres de news crypto (sans les analyser)."""
+    try:
+        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories=BTC"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        raw_articles = data.get("Data") if isinstance(data, dict) else None
+        if not isinstance(raw_articles, list):
+            return []
+        return [
+            str(a.get("title", "")) for a in raw_articles[:15]
+            if isinstance(a, dict) and a.get("title")
+        ]
+    except Exception as e:
+        log.error("Échec récupération headlines : %s", e)
+        return []
+
+
+def analyze_sentiment_with_claude(headlines):
+    """Envoie les titres à Claude pour une vraie analyse de sentiment contextuelle."""
+    if not ANTHROPIC_API_KEY or not headlines:
+        return None
+
+    prompt = (
+        "Voici les derniers titres de news sur le Bitcoin :\n\n"
+        + "\n".join(f"- {h}" for h in headlines)
+        + "\n\nDonne un score de sentiment de marché entre -5 (très négatif, "
+        "risque de panique/vente) et +5 (très positif, climat favorable à l'achat). "
+        "Réponds UNIQUEMENT avec un objet JSON de la forme "
+        '{"score": <entier>, "raison": "<une phrase courte>"}, rien d\'autre.'
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["content"][0]["text"].strip()
+        # Nettoyage au cas où le modèle ajoute des balises markdown malgré la consigne
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+        return int(parsed.get("score", 0)), parsed.get("raison", "")
+    except Exception as e:
+        log.error("Échec analyse Claude : %s", e)
+        return None
 
 
 def fetch_news_sentiment():
@@ -141,42 +212,23 @@ def fetch_news_sentiment():
     if now - NEWS_CACHE["last_fetch"] < NEWS_REFRESH_SECONDS and NEWS_CACHE["headlines"]:
         return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
 
-    try:
-        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories=BTC"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-
-        raw_articles = data.get("Data") if isinstance(data, dict) else None
-        if not isinstance(raw_articles, list):
-            log.warning("Réponse news inattendue (pas de liste d'articles), sentiment neutre par défaut")
-            NEWS_CACHE["last_fetch"] = now
-            return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
-
-        articles = raw_articles[:15]
-
-        score = 0
-        headlines = []
-        for article in articles:
-            if not isinstance(article, dict):
-                continue
-            title = str(article.get("title", "")).lower()
-            headlines.append(article.get("title", ""))
-            for word in POSITIVE_WORDS:
-                if word in title:
-                    score += 1
-            for word in NEGATIVE_WORDS:
-                if word in title:
-                    score -= 1
-
-        NEWS_CACHE["score"] = score
-        NEWS_CACHE["headlines"] = headlines[:5]
-        NEWS_CACHE["last_fetch"] = now
-        return score, headlines[:5]
-
-    except Exception as e:
-        log.error("Échec récupération news : %s", e)
+    headlines = fetch_raw_headlines()
+    if not headlines:
         NEWS_CACHE["last_fetch"] = now
         return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
+
+    result = analyze_sentiment_with_claude(headlines)
+    if result is None:
+        log.warning("Analyse Claude indisponible, sentiment neutre conservé")
+        NEWS_CACHE["last_fetch"] = now
+        return NEWS_CACHE["score"], NEWS_CACHE["headlines"]
+
+    score, raison = result
+    log.info("Sentiment Claude : score=%d, raison=%s", score, raison)
+    NEWS_CACHE["score"] = score
+    NEWS_CACHE["headlines"] = headlines[:5]
+    NEWS_CACHE["last_fetch"] = now
+    return score, headlines[:5]
 
 
 def execute_buy(exchange, price):
@@ -217,7 +269,11 @@ def execute_sell(exchange, price):
     )
 
 
+# ============================================================
+# SCALPING (court terme) — poche isolée, cycle rapide entrée/sortie
+# ============================================================
 def check_scalp_opportunity(closes):
+    """Détecte un mouvement de prix rapide sur la fenêtre récente."""
     if len(closes) < SCALP_MOMENTUM_WINDOW + 1:
         return False, 0.0
     past_price = closes[-(SCALP_MOMENTUM_WINDOW + 1)]
@@ -229,6 +285,9 @@ def check_scalp_opportunity(closes):
 
 
 def execute_scalp_buy(price, momentum_pct):
+    # Le scalping reste toujours en simulation (paper), même si TRADING_MODE=live,
+    # tant que cette logique n'a pas été testée en conditions réelles sur plusieurs
+    # semaines. C'est une protection volontaire, pas un oubli.
     spend = state.scalp_cash
     fee = spend * FEE_RATE
     amount = (spend - fee) / price
@@ -247,6 +306,7 @@ def execute_scalp_buy(price, momentum_pct):
 
 
 def check_scalp_exit(price):
+    """Vérifie si une position de scalp doit être fermée (take profit, stop loss, ou délai max)."""
     if not state.scalp_position:
         return None
 
@@ -337,6 +397,7 @@ def main_loop():
             elif not signal_long and state.position:
                 execute_sell(exchange, price)
 
+            # --- Poche court terme (scalping) ---
             if state.scalp_position:
                 exit_reason = check_scalp_exit(price)
                 if exit_reason:
