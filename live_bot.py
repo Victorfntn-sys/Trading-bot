@@ -40,7 +40,9 @@ FEE_RATE = 0.001
 POLL_SECONDS = 60
 STATUS_EVERY_N_LOOPS = 60
 
-MAX_POSITION_PCT = 0.95
+MAX_POSITION_PCT = 0.95      # taille maximale investie si la tendance est très forte
+MIN_POSITION_PCT = 0.40      # taille minimale investie si le signal vient tout juste de se déclencher
+TREND_STRENGTH_CAP_PCT = 1.0 # écart MA (%) à partir duquel la tendance est considérée "forte" (position max)
 DAILY_LOSS_LIMIT_PCT = -5.0
 
 # Poche court terme (scalping) — isolée du capital principal pour limiter le risque
@@ -231,8 +233,15 @@ def fetch_news_sentiment():
     return score, headlines[:5]
 
 
-def execute_buy(exchange, price):
-    spend = state.cash * MAX_POSITION_PCT
+def compute_position_pct(trend_strength_pct):
+    """Plus l'écart entre MA10 et MA25 est grand, plus la position est importante."""
+    ratio = min(1.0, max(0.0, trend_strength_pct / TREND_STRENGTH_CAP_PCT))
+    return MIN_POSITION_PCT + (MAX_POSITION_PCT - MIN_POSITION_PCT) * ratio
+
+
+def execute_buy(exchange, price, trend_strength_pct):
+    position_pct = compute_position_pct(trend_strength_pct)
+    spend = state.cash * position_pct
     fee = spend * FEE_RATE
     amount = (spend - fee) / price
 
@@ -246,6 +255,7 @@ def execute_buy(exchange, price):
 
     send_telegram(
         f"🟢 ACHAT {SYMBOL}\nPrix : {price:.2f} USD\nMontant : {amount:.6f}\n"
+        f"Taille position : {position_pct*100:.0f}% (force tendance : {trend_strength_pct:.2f}%)\n"
         f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USD"
     )
 
@@ -380,6 +390,7 @@ def main_loop():
             short_ma = mean(closes[-SHORT_WINDOW:])
             long_ma = mean(closes[-LONG_WINDOW:])
             signal_long = short_ma > long_ma
+            trend_strength_pct = (short_ma - long_ma) / long_ma * 100 if long_ma else 0
 
             news_score, headlines = fetch_news_sentiment()
             news_blocks_buy = news_score <= NEWS_NEGATIVE_THRESHOLD
@@ -393,7 +404,7 @@ def main_loop():
                         f"est trop négatif pour agir."
                     )
                 else:
-                    execute_buy(exchange, price)
+                    execute_buy(exchange, price, trend_strength_pct)
             elif not signal_long and state.position:
                 execute_sell(exchange, price)
 
