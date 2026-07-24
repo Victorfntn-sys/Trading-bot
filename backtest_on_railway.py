@@ -1,24 +1,20 @@
 """
-Backtest exécuté directement sur Railway — résultats envoyés sur Telegram
-===========================================================================
+Backtest multi-périodes exécuté sur Railway — résultats envoyés sur Telegram
+==============================================================================
 
-Contrairement à un backtest local, ce script tourne dans le même environnement
-que le bot (Railway), utilise les mêmes variables d'environnement Telegram,
-et envoie le résultat (résumé texte + graphique) directement dans ta
-conversation Telegram. Aucune installation sur ton téléphone/ordinateur.
+Découpe l'historique disponible en 3 tiers (début / milieu / fin) et teste la
+stratégie sur chacun séparément, en plus du test sur la période complète.
+Objectif : voir si la stratégie tient dans différentes phases de marché,
+plutôt que de se fier à un seul résultat global qui peut cacher de grosses
+variations.
 
 COMMENT L'UTILISER :
-1. Sur Railway, va dans Settings du service → cherche "Custom Start Command"
-2. Remplace temporairement par : python backtest_on_railway.py
-3. Sauvegarde (ça redéploie automatiquement)
-4. Attends quelques minutes — les résultats arrivent sur Telegram
-5. Une fois reçus, REMETS le Custom Start Command sur : python live_bot.py
-   (sinon le bot de trading normal ne tournera plus)
+1. Sur Railway, Settings du service -> Custom Start Command ->
+   python backtest_on_railway.py
+2. Sauvegarde, attends les résultats sur Telegram
+3. Remets ensuite le Custom Start Command sur : python live_bot.py
 
-Le filtre news n'est pas inclus (pas d'archive historique de news gratuite
-disponible). Seules les stratégies tendance + scalp sont testées, sur les
-données réellement disponibles chez Kraken (leur profondeur d'historique en
-bougies 1 minute est limitée ; le résumé indique la période réellement couverte).
+Le filtre news n'est pas inclus (pas d'archive historique disponible).
 """
 
 import os
@@ -26,7 +22,7 @@ import time
 import logging
 
 import matplotlib
-matplotlib.use("Agg")  # pas d'affichage graphique sur un serveur, on sauvegarde en fichier
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import ccxt
@@ -35,12 +31,9 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("backtest")
 
-# ============================================================
-# CONFIGURATION (identique au bot en production)
-# ============================================================
 SYMBOL = "BTC/USD"
 TIMEFRAME = "1m"
-BACKTEST_DAYS = int(os.environ.get("BACKTEST_DAYS", "14"))  # ajustable via variable d'env
+BACKTEST_DAYS = int(os.environ.get("BACKTEST_DAYS", "14"))
 SHORT_WINDOW = 10
 LONG_WINDOW = 25
 INITIAL_CAPITAL = 1000.0
@@ -91,7 +84,7 @@ def fetch_history(symbol, timeframe, days):
 
     all_candles = []
     attempts = 0
-    while attempts < 200:  # garde-fou pour ne jamais tourner indéfiniment
+    while attempts < 200:
         batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=720)
         attempts += 1
         if not batch:
@@ -151,15 +144,13 @@ def run_backtest(candles):
         if scalp_position:
             change_pct = (price - scalp_entry_price) / scalp_entry_price * 100
             held_minutes = i - scalp_entry_index
-            exit_now = False
+            exit_now, win = False, False
             if change_pct >= SCALP_TAKE_PROFIT_PCT:
                 exit_now, win = True, True
             elif change_pct <= -SCALP_STOP_LOSS_PCT:
                 exit_now, win = True, False
             elif held_minutes >= SCALP_MAX_HOLD_MINUTES:
                 exit_now, win = True, change_pct > 0
-            else:
-                win = False
 
             if exit_now:
                 if win:
@@ -201,57 +192,47 @@ def run_backtest(candles):
     }
 
 
-def build_summary(result, candles):
+def summarize_period(label, candles):
+    if len(candles) < LONG_WINDOW + 10:
+        return f"[{label}] Pas assez de données ({len(candles)} bougies)\n"
+
+    result = run_backtest(candles)
     equity = result["equity"]
     buy_hold = result["buy_hold"]
 
-    final_equity = equity[-1]
-    final_buy_hold = buy_hold[-1]
-    total_return_pct = (final_equity / INITIAL_CAPITAL - 1) * 100
-    buy_hold_return_pct = (final_buy_hold / INITIAL_CAPITAL - 1) * 100
+    total_return_pct = (equity[-1] / INITIAL_CAPITAL - 1) * 100
+    buy_hold_return_pct = (buy_hold[-1] / INITIAL_CAPITAL - 1) * 100
 
     running_max = equity[0]
     max_drawdown = 0.0
     for e in equity:
         running_max = max(running_max, e)
-        dd = (e - running_max) / running_max * 100
-        max_drawdown = min(max_drawdown, dd)
+        max_drawdown = min(max_drawdown, (e - running_max) / running_max * 100)
 
     scalp_trades = result["scalp_trades"]
     scalp_wins = result["scalp_wins"]
     scalp_win_rate = (scalp_wins / scalp_trades * 100) if scalp_trades > 0 else 0
 
-    first_ts = candles[0][0] / 1000
-    last_ts = candles[-1][0] / 1000
-    actual_days = (last_ts - first_ts) / 86400
+    first_date = time.strftime("%d/%m", time.gmtime(candles[0][0] / 1000))
+    last_date = time.strftime("%d/%m", time.gmtime(candles[-1][0] / 1000))
 
-    verdict = (
-        "✅ La stratégie bat le buy & hold sur cette période."
-        if total_return_pct > buy_hold_return_pct
-        else "❌ Le simple buy & hold fait mieux ici."
-    )
+    verdict = "✅" if total_return_pct > buy_hold_return_pct else "❌"
 
     return (
-        f"📊 Résultat du backtest (tendance + scalp)\n\n"
-        f"Symbole : {SYMBOL}\n"
-        f"Période réellement couverte : {actual_days:.1f} jours ({len(candles)} bougies 1min)\n\n"
-        f"Capital initial : {INITIAL_CAPITAL:.0f} USD\n"
-        f"Capital final : {final_equity:.2f} USD ({total_return_pct:+.2f}%)\n"
-        f"Buy & hold équivalent : {final_buy_hold:.2f} USD ({buy_hold_return_pct:+.2f}%)\n"
-        f"Max drawdown : {max_drawdown:.2f}%\n\n"
-        f"Trades tendance : {result['trend_trades']}\n"
-        f"Trades scalp : {scalp_trades} (réussite ~{scalp_win_rate:.0f}%)\n\n"
-        f"{verdict}\n\n"
-        f"⚠️ Filtre news exclu (pas d'historique dispo). Résultat passé ≠ garantie future."
+        f"[{label}] {first_date} → {last_date}\n"
+        f"  Stratégie : {total_return_pct:+.2f}% | Buy&Hold : {buy_hold_return_pct:+.2f}% {verdict}\n"
+        f"  Max drawdown : {max_drawdown:.2f}% | Trades tendance : {result['trend_trades']} | "
+        f"Scalp : {scalp_trades} ({scalp_win_rate:.0f}% réussite)\n"
     )
 
 
-def plot_and_save(result):
+def plot_full_period(candles):
+    result = run_backtest(candles)
     plt.figure(figsize=(10, 5))
     dates = [t / 1000 for t in result["timestamps"]]
     plt.plot(dates, result["equity"], label="Stratégie combinée")
     plt.plot(dates, result["buy_hold"], label="Buy & Hold", linestyle="--")
-    plt.title(f"Backtest {SYMBOL} — Tendance + Scalp")
+    plt.title(f"Backtest {SYMBOL} — période complète")
     plt.ylabel("Portefeuille (USD)")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -262,30 +243,45 @@ def plot_and_save(result):
 
 
 if __name__ == "__main__":
-    log.info("Démarrage du backtest (%d jours demandés)", BACKTEST_DAYS)
-    send_telegram_text(f"🔬 Backtest lancé sur Railway ({BACKTEST_DAYS} jours demandés)...")
+    log.info("Démarrage du backtest multi-périodes (%d jours demandés)", BACKTEST_DAYS)
+    send_telegram_text(f"🔬 Backtest multi-périodes lancé sur Railway ({BACKTEST_DAYS} jours demandés)...")
 
     try:
         candles = fetch_history(SYMBOL, TIMEFRAME, BACKTEST_DAYS)
         log.info("%d bougies récupérées", len(candles))
 
-        if len(candles) < LONG_WINDOW + 10:
+        if len(candles) < (LONG_WINDOW + 10) * 3:
             send_telegram_text(
-                f"⚠️ Pas assez de données historiques disponibles ({len(candles)} bougies). "
+                f"⚠️ Pas assez de données pour découper en 3 périodes ({len(candles)} bougies). "
                 f"Kraken limite la profondeur d'historique en 1 minute."
             )
         else:
-            result = run_backtest(candles)
-            summary = build_summary(result, candles)
+            n = len(candles)
+            third = n // 3
+            period1 = candles[:third]
+            period2 = candles[third:2 * third]
+            period3 = candles[2 * third:]
+
+            summary = "📊 Backtest multi-périodes (tendance + scalp)\n\n"
+            summary += summarize_period("Période complète", candles) + "\n"
+            summary += summarize_period("Tiers 1 (le plus ancien)", period1) + "\n"
+            summary += summarize_period("Tiers 2 (milieu)", period2) + "\n"
+            summary += summarize_period("Tiers 3 (le plus récent)", period3) + "\n"
+            summary += (
+                "\n⚠️ Filtre news exclu. Si les résultats varient beaucoup entre "
+                "tiers, la stratégie est sensible au contexte de marché — normal, "
+                "mais à garder en tête. Résultat passé ≠ garantie future."
+            )
+
             send_telegram_text(summary)
 
-            chart_path = plot_and_save(result)
-            send_telegram_photo(chart_path, caption="Courbe du portefeuille (stratégie vs buy & hold)")
+            chart_path = plot_full_period(candles)
+            send_telegram_photo(chart_path, caption="Courbe sur la période complète")
 
-            log.info("Backtest terminé et envoyé sur Telegram")
+            log.info("Backtest multi-périodes terminé et envoyé sur Telegram")
 
     except Exception as e:
         log.error("Erreur pendant le backtest : %s", e)
         send_telegram_text(f"⚠️ Erreur pendant le backtest : {e}")
 
-    log.info("Script terminé. Remets le Custom Start Command sur 'python live_bot.py' pour reprendre le trading normal.")
+    log.info("Script terminé. Remets le Custom Start Command sur 'python live_bot.py'.")
