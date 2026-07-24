@@ -54,7 +54,22 @@ MIN_POSITION_PCT = 0.40
 TREND_STRENGTH_CAP_PCT = 1.0
 DAILY_LOSS_LIMIT_PCT = -5.0
 
-TREND_STOP_LOSS_PCT = 3.0   # vente forcée si la position tendance perd 3%, peu importe le signal MA
+TREND_STOP_LOSS_PCT = 3.0   # vente forcée (plancher absolu) si la position perd 3%, peu importe le signal MA
+
+TRAILING_STOP_ACTIVATION_PCT = 1.0  # le trailing stop ne s'active qu'une fois +1% de gain atteint
+TRAILING_STOP_PCT = 2.0             # une fois activé, vend si le prix retombe de 2% sous son plus haut
+
+ROI_TABLE = [  # (minutes détenues, profit % requis pour sortir) — dégressif dans le temps
+    (0, 5.0),
+    (60, 2.5),
+    (180, 1.0),
+]
+
+STOPLOSS_GUARD_LOOKBACK_MINUTES = 240  # fenêtre d'observation (4h)
+STOPLOSS_GUARD_TRADE_LIMIT = 2          # si 2 stop-loss tendance dans cette fenêtre...
+STOPLOSS_GUARD_PAUSE_MINUTES = 120      # ...pause les nouveaux achats tendance pendant 2h
+
+COOLDOWN_MINUTES = 15  # attend 15 min après une vente tendance avant de pouvoir racheter
 
 MIN_VOLATILITY_PCT = 0.3    # écart min (haut-bas) sur la fenêtre LONG_WINDOW pour autoriser un achat tendance
 
@@ -156,6 +171,10 @@ class BotState:
             self.coins = saved["coins"]
             self.position = saved["position"]
             self.entry_price = saved.get("entry_price")
+            self.entry_time = saved.get("entry_time")
+            self.trend_highest_price = saved.get("trend_highest_price")
+            self.last_sell_time = saved.get("last_sell_time")
+            self.guard_paused_until = saved.get("guard_paused_until")
             self.day_start_equity = saved["day_start_equity"]
             self.day_start_date = datetime.fromisoformat(saved["day_start_date"]).date()
             self.loop_count = saved["loop_count"]
@@ -171,6 +190,10 @@ class BotState:
             self.coins = 0.0
             self.position = False
             self.entry_price = None
+            self.entry_time = None
+            self.trend_highest_price = None
+            self.last_sell_time = None
+            self.guard_paused_until = None
             self.day_start_equity = INITIAL_CAPITAL
             self.day_start_date = datetime.utcnow().date()
             self.loop_count = 0
@@ -202,6 +225,10 @@ class BotState:
             "coins": self.coins,
             "position": self.position,
             "entry_price": self.entry_price,
+            "entry_time": self.entry_time,
+            "trend_highest_price": self.trend_highest_price,
+            "last_sell_time": self.last_sell_time,
+            "guard_paused_until": self.guard_paused_until,
             "day_start_equity": self.day_start_equity,
             "day_start_date": self.day_start_date.isoformat(),
             "loop_count": self.loop_count,
@@ -355,6 +382,8 @@ def execute_buy(exchange, price, trend_strength_pct):
     state.cash -= spend
     state.position = True
     state.entry_price = price
+    state.entry_time = time.time()
+    state.trend_highest_price = price
     state.save()
     log_trade("trend", "buy", price, amount)
 
@@ -379,16 +408,94 @@ def execute_sell(exchange, price, reason="signal"):
     state.coins = 0.0
     state.position = False
     state.entry_price = None
+    state.entry_time = None
+    state.trend_highest_price = None
+    state.last_sell_time = time.time()
     state.save()
     log_trade("trend", "sell", price, sold_amount, reason=reason, pnl_pct=pnl_pct)
 
-    reason_label = "🛑 Stop-loss déclenché" if reason == "stop_loss" else "Signal de sortie"
+    reason_labels = {
+        "stop_loss": "🛑 Stop-loss (plancher) déclenché",
+        "trailing_stop": "📉 Stop-loss traînant déclenché (gain protégé)",
+        "roi": "🎯 Objectif de profit atteint",
+        "signal": "Signal de sortie (croisement MA)",
+    }
+    reason_label = reason_labels.get(reason, reason)
     pnl_text = f"\nRésultat : {pnl_pct:+.2f}%" if pnl_pct is not None else ""
     send_telegram(
         f"🔴 VENTE {SYMBOL} (tendance)\n{reason_label}\nPrix : {price:.2f} USD\n"
         f"Montant : {sold_amount:.6f}{pnl_text}\n"
         f"Mode : {TRADING_MODE.upper()}\nPortefeuille : {state.equity(price):.2f} USD"
     )
+
+
+def check_roi_exit(price):
+    """Objectif de profit dégressif dans le temps (inspiré de la ROI table de Freqtrade)."""
+    if not state.position or not state.entry_price or not state.entry_time:
+        return None
+    held_minutes = (time.time() - state.entry_time) / 60
+    profit_pct = (price - state.entry_price) / state.entry_price * 100
+
+    applicable_target = ROI_TABLE[0][1]
+    for minutes_threshold, target in ROI_TABLE:
+        if held_minutes >= minutes_threshold:
+            applicable_target = target
+
+    if profit_pct >= applicable_target:
+        return "roi"
+    return None
+
+
+def check_trailing_stop(price):
+    """Stop-loss qui remonte avec le prix pour protéger les gains, sans jamais redescendre."""
+    if not state.position or not state.entry_price:
+        return None
+
+    if state.trend_highest_price is None or price > state.trend_highest_price:
+        state.trend_highest_price = price
+
+    profit_from_entry_pct = (state.trend_highest_price - state.entry_price) / state.entry_price * 100
+    if profit_from_entry_pct >= TRAILING_STOP_ACTIVATION_PCT:
+        trailing_stop_price = state.trend_highest_price * (1 - TRAILING_STOP_PCT / 100)
+        if price <= trailing_stop_price:
+            return "trailing_stop"
+    return None
+
+
+def is_stoploss_guard_active():
+    """Pause les nouveaux achats tendance si trop de stop-loss récents (inspiré de StoplossGuard)."""
+    if state.guard_paused_until and time.time() < state.guard_paused_until:
+        return True
+
+    trades = load_json_file(TRADES_FILE, [])
+    cutoff = time.time() - STOPLOSS_GUARD_LOOKBACK_MINUTES * 60
+    recent_stoplosses = [
+        t for t in trades
+        if t.get("pocket") == "trend"
+        and t.get("side") == "sell"
+        and t.get("reason") in ("stop_loss", "trailing_stop")
+        and datetime.fromisoformat(t["time"]).timestamp() >= cutoff
+    ]
+    if len(recent_stoplosses) >= STOPLOSS_GUARD_TRADE_LIMIT:
+        state.guard_paused_until = time.time() + STOPLOSS_GUARD_PAUSE_MINUTES * 60
+        state.save()
+        log.warning(
+            "Stoploss guard activé : %d stop-loss en %d min, pause achats tendance %d min",
+            len(recent_stoplosses), STOPLOSS_GUARD_LOOKBACK_MINUTES, STOPLOSS_GUARD_PAUSE_MINUTES,
+        )
+        send_telegram(
+            f"⏸️ Pause protectrice activée\n{len(recent_stoplosses)} stop-loss tendance récents.\n"
+            f"Pas de nouvel achat tendance pendant {STOPLOSS_GUARD_PAUSE_MINUTES} minutes."
+        )
+        return True
+    return False
+
+
+def is_in_cooldown():
+    """Empêche de racheter juste après avoir vendu (évite les allers-retours inutiles)."""
+    if not state.last_sell_time:
+        return False
+    return (time.time() - state.last_sell_time) < COOLDOWN_MINUTES * 60
 
 
 # ============================================================
@@ -481,7 +588,8 @@ def main_loop():
     send_telegram(
         f"🤖 Bot démarré (ou redémarré)\nSymbole : {SYMBOL}\nMode : {TRADING_MODE.upper()}\n"
         f"Position tendance : {'LONG' if state.position else 'CASH'} | Scalp : {'LONG' if state.scalp_position else 'CASH'}\n"
-        f"Filtre news actif | Stop-loss tendance : -{TREND_STOP_LOSS_PCT}%"
+        f"Stop-loss : -{TREND_STOP_LOSS_PCT}% | Trailing stop actif dès +{TRAILING_STOP_ACTIVATION_PCT}%\n"
+        f"ROI dégressif, cooldown {COOLDOWN_MINUTES}min, pause protectrice après {STOPLOSS_GUARD_TRADE_LIMIT} stop-loss"
     )
 
     while True:
@@ -507,11 +615,24 @@ def main_loop():
                 )
                 continue
 
-            # --- Stop-loss tendance, vérifié en priorité ---
+            # --- Sorties tendance, vérifiées par ordre de priorité ---
             if state.position and state.entry_price:
                 change_pct = (price - state.entry_price) / state.entry_price * 100
+                exit_reason = None
+
                 if change_pct <= -TREND_STOP_LOSS_PCT:
-                    execute_sell(exchange, price, reason="stop_loss")
+                    exit_reason = "stop_loss"
+                else:
+                    trailing_reason = check_trailing_stop(price)
+                    if trailing_reason:
+                        exit_reason = trailing_reason
+                    else:
+                        roi_reason = check_roi_exit(price)
+                        if roi_reason:
+                            exit_reason = roi_reason
+
+                if exit_reason:
+                    execute_sell(exchange, price, reason=exit_reason)
 
             short_ma = mean(closes[-SHORT_WINDOW:])
             long_ma = mean(closes[-LONG_WINDOW:])
@@ -531,6 +652,10 @@ def main_loop():
                         "Achat tendance bloqué par le filtre volatilité (%.2f%% < %.2f%%)",
                         volatility_pct, MIN_VOLATILITY_PCT,
                     )
+                elif is_in_cooldown():
+                    log.info("Achat tendance bloqué par le cooldown post-vente")
+                elif is_stoploss_guard_active():
+                    log.info("Achat tendance bloqué par le stoploss guard")
                 else:
                     execute_buy(exchange, price, trend_strength_pct)
             elif not signal_long and state.position:
