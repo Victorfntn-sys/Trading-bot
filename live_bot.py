@@ -54,24 +54,24 @@ MIN_POSITION_PCT = 0.40
 TREND_STRENGTH_CAP_PCT = 1.0
 DAILY_LOSS_LIMIT_PCT = -5.0
 
-TREND_STOP_LOSS_PCT = 3.0   # vente forcée (plancher absolu) si la position perd 3%, peu importe le signal MA
+TREND_STOP_LOSS_PCT = 3.0
 
-TRAILING_STOP_ACTIVATION_PCT = 1.0  # le trailing stop ne s'active qu'une fois +1% de gain atteint
-TRAILING_STOP_PCT = 2.0             # une fois activé, vend si le prix retombe de 2% sous son plus haut
+TRAILING_STOP_ACTIVATION_PCT = 1.0
+TRAILING_STOP_PCT = 2.0
 
-ROI_TABLE = [  # (minutes détenues, profit % requis pour sortir) — dégressif dans le temps
+ROI_TABLE = [
     (0, 5.0),
     (60, 2.5),
     (180, 1.0),
 ]
 
-STOPLOSS_GUARD_LOOKBACK_MINUTES = 240  # fenêtre d'observation (4h)
-STOPLOSS_GUARD_TRADE_LIMIT = 2          # si 2 stop-loss tendance dans cette fenêtre...
-STOPLOSS_GUARD_PAUSE_MINUTES = 120      # ...pause les nouveaux achats tendance pendant 2h
+STOPLOSS_GUARD_LOOKBACK_MINUTES = 240
+STOPLOSS_GUARD_TRADE_LIMIT = 2
+STOPLOSS_GUARD_PAUSE_MINUTES = 120
 
-COOLDOWN_MINUTES = 15  # attend 15 min après une vente tendance avant de pouvoir racheter
+COOLDOWN_MINUTES = 15
 
-MIN_VOLATILITY_PCT = 0.15   # écart min (haut-bas) sur la fenêtre LONG_WINDOW pour autoriser un achat tendance
+MIN_VOLATILITY_PCT = 0.15
                               # (ajusté le 24/07 sur la base de relevés réels : ~0.21% en marché calme)
 
 SCALP_ALLOCATION_PCT = 0.30
@@ -154,10 +154,25 @@ def compute_trade_stats():
     sells = [t for t in trades if t["side"] == "sell" and t.get("pnl_pct") is not None]
     if not sells:
         return None
-    wins = [t for t in sells if t["pnl_pct"] > 0]
-    win_rate = len(wins) / len(sells) * 100
-    avg_pnl = sum(t["pnl_pct"] for t in sells) / len(sells)
-    return {"total_trades": len(sells), "win_rate": win_rate, "avg_pnl_pct": avg_pnl}
+
+    def stats_for(pocket_sells):
+        if not pocket_sells:
+            return None
+        wins = [t for t in pocket_sells if t["pnl_pct"] > 0]
+        return {
+            "total_trades": len(pocket_sells),
+            "win_rate": len(wins) / len(pocket_sells) * 100,
+            "avg_pnl_pct": sum(t["pnl_pct"] for t in pocket_sells) / len(pocket_sells),
+        }
+
+    trend_sells = [t for t in sells if t.get("pocket") == "trend"]
+    scalp_sells = [t for t in sells if t.get("pocket") == "scalp"]
+
+    return {
+        "overall": stats_for(sells),
+        "trend": stats_for(trend_sells),
+        "scalp": stats_for(scalp_sells),
+    }
 
 
 # ============================================================
@@ -431,7 +446,6 @@ def execute_sell(exchange, price, reason="signal"):
 
 
 def check_roi_exit(price):
-    """Objectif de profit dégressif dans le temps (inspiré de la ROI table de Freqtrade)."""
     if not state.position or not state.entry_price or not state.entry_time:
         return None
     held_minutes = (time.time() - state.entry_time) / 60
@@ -448,7 +462,6 @@ def check_roi_exit(price):
 
 
 def check_trailing_stop(price):
-    """Stop-loss qui remonte avec le prix pour protéger les gains, sans jamais redescendre."""
     if not state.position or not state.entry_price:
         return None
 
@@ -464,7 +477,6 @@ def check_trailing_stop(price):
 
 
 def is_stoploss_guard_active():
-    """Pause les nouveaux achats tendance si trop de stop-loss récents (inspiré de StoplossGuard)."""
     if state.guard_paused_until and time.time() < state.guard_paused_until:
         return True
 
@@ -493,7 +505,6 @@ def is_stoploss_guard_active():
 
 
 def is_in_cooldown():
-    """Empêche de racheter juste après avoir vendu (évite les allers-retours inutiles)."""
     if not state.last_sell_time:
         return False
     return (time.time() - state.last_sell_time) < COOLDOWN_MINUTES * 60
@@ -678,11 +689,18 @@ def main_loop():
             if state.loop_count % STATUS_EVERY_N_LOOPS == 0:
                 pnl_pct = (current_total_equity / INITIAL_CAPITAL - 1) * 100
                 stats = compute_trade_stats()
-                stats_text = (
-                    f"\nHistorique : {stats['total_trades']} trades clôturés, "
-                    f"{stats['win_rate']:.0f}% de réussite, {stats['avg_pnl_pct']:+.2f}% en moyenne"
-                    if stats else "\nHistorique : pas encore assez de trades clôturés"
-                )
+                if stats:
+                    def fmt(label, s):
+                        if not s:
+                            return f"{label} : aucun trade clôturé"
+                        return f"{label} : {s['total_trades']} trades, {s['win_rate']:.0f}% réussite, {s['avg_pnl_pct']:+.2f}% moy."
+                    stats_text = (
+                        f"\n{fmt('Global', stats['overall'])}"
+                        f"\n{fmt('Tendance', stats['trend'])}"
+                        f"\n{fmt('Scalp', stats['scalp'])}"
+                    )
+                else:
+                    stats_text = "\nHistorique : pas encore assez de trades clôturés"
                 send_telegram(
                     f"📊 État du bot\nPrix {SYMBOL} : {price:.2f}\n"
                     f"Position tendance : {'LONG' if state.position else 'CASH'}\n"
