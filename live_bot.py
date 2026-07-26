@@ -74,6 +74,11 @@ COOLDOWN_MINUTES = 15
 MIN_VOLATILITY_PCT = 0.15
                               # (ajusté le 24/07 sur la base de relevés réels : ~0.21% en marché calme)
 
+MIN_TREND_STRENGTH_PCT = 0.05  # écart minimum MA10/MA25 requis pour agir — évite d'acheter sur un
+                                 # croisement quasi nul (bruit), ajouté le 26/07 après diagnostic :
+                                 # 33 trades tendance, 33% réussite, -0.04% moyenne, souvent déclenchés
+                                 # avec une force de tendance ridicule (0.04% observé)
+
 SCALP_ALLOCATION_PCT = 0.30
 SCALP_MOMENTUM_WINDOW = 5
 SCALP_ENTRY_THRESHOLD_PCT = 1.5
@@ -655,6 +660,7 @@ def main_loop():
             news_score, headlines = fetch_news_sentiment()
             news_blocks_buy = news_score <= NEWS_NEGATIVE_THRESHOLD
             volatility_blocks_buy = volatility_pct < MIN_VOLATILITY_PCT
+            trend_too_weak = trend_strength_pct < MIN_TREND_STRENGTH_PCT
 
             if signal_long and not state.position:
                 if news_blocks_buy:
@@ -663,6 +669,11 @@ def main_loop():
                     log.info(
                         "Achat tendance bloqué par le filtre volatilité (%.2f%% < %.2f%%)",
                         volatility_pct, MIN_VOLATILITY_PCT,
+                    )
+                elif trend_too_weak:
+                    log.info(
+                        "Achat tendance bloqué : croisement trop faible (%.2f%% < %.2f%%)",
+                        trend_strength_pct, MIN_TREND_STRENGTH_PCT,
                     )
                 elif is_in_cooldown():
                     log.info("Achat tendance bloqué par le cooldown post-vente")
