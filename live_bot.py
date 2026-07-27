@@ -42,8 +42,9 @@ log = logging.getLogger("trading-bot")
 # ============================================================
 SYMBOL = "BTC/USD"
 TIMEFRAME = "1m"
-SHORT_WINDOW = 10
-LONG_WINDOW = 25
+SHORT_WINDOW = 30   # élargi le 27/07 (était 10) — lisse le bruit après diagnostic : trop de faux
+LONG_WINDOW = 75    # signaux sur des fenêtres courtes (33% puis 31% de réussite sur 52 trades)
+VOLATILITY_WINDOW = 25  # séparée de LONG_WINDOW pour garder le seuil de volatilité calibré valide
 INITIAL_CAPITAL = 1000.0
 FEE_RATE = 0.001
 POLL_SECONDS = 60
@@ -74,10 +75,8 @@ COOLDOWN_MINUTES = 15
 MIN_VOLATILITY_PCT = 0.15
                               # (ajusté le 24/07 sur la base de relevés réels : ~0.21% en marché calme)
 
-MIN_TREND_STRENGTH_PCT = 0.05  # écart minimum MA10/MA25 requis pour agir — évite d'acheter sur un
-                                 # croisement quasi nul (bruit), ajouté le 26/07 après diagnostic :
-                                 # 33 trades tendance, 33% réussite, -0.04% moyenne, souvent déclenchés
-                                 # avec une force de tendance ridicule (0.04% observé)
+MIN_TREND_STRENGTH_PCT = 0.05  # écart minimum MA30/MA75 requis pour agir — évite d'acheter sur un
+                                 # croisement quasi nul (bruit)
 
 SCALP_ALLOCATION_PCT = 0.30
 SCALP_MOMENTUM_WINDOW = 5
@@ -616,7 +615,7 @@ def main_loop():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            closes = fetch_closes(exchange, SYMBOL, TIMEFRAME, LONG_WINDOW + 5)
+            closes = fetch_closes(exchange, SYMBOL, TIMEFRAME, max(LONG_WINDOW, VOLATILITY_WINDOW) + 5)
             price = closes[-1]
 
             state.reset_daily_tracker_if_needed(price)
@@ -655,7 +654,7 @@ def main_loop():
             long_ma = mean(closes[-LONG_WINDOW:])
             signal_long = short_ma > long_ma
             trend_strength_pct = (short_ma - long_ma) / long_ma * 100 if long_ma else 0
-            volatility_pct = compute_volatility_pct(closes, LONG_WINDOW)
+            volatility_pct = compute_volatility_pct(closes, VOLATILITY_WINDOW)
 
             news_score, headlines = fetch_news_sentiment()
             news_blocks_buy = news_score <= NEWS_NEGATIVE_THRESHOLD
