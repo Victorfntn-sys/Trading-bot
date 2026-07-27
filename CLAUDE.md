@@ -2,114 +2,126 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository overview
+## Vue d'ensemble
 
-A BTC/USD crypto trading bot for Kraken, deployed on Railway. It is a tiny, dependency-light
-Python project — no package structure, no tests, no build step. Two standalone scripts, run one
-at a time via Railway's "Custom Start Command":
+Un bot de trading crypto BTC/USD sur Kraken, déployé sur Railway. C'est un projet minimaliste et
+peu dépendant — pas de structure de package, pas de tests, pas d'étape de build. Deux scripts
+autonomes, exécutés un à la fois via le "Custom Start Command" de Railway :
 
-- **`live_bot.py`** — the production bot. Runs forever (`main_loop`), polling Kraken every
-  `POLL_SECONDS` (60s), managing two independent trading "pockets" (trend + scalp), and sending
-  Telegram notifications for every trade/state change.
-- **`backtest_on_railway.py`** — a one-shot script that fetches historical candles from Kraken,
-  replays the same strategy logic, and sends the results (text summary + equity chart) to
-  Telegram. Meant to be run temporarily by swapping Railway's start command, then swapped back.
+- **`live_bot.py`** — le bot en production. Tourne en continu (`main_loop`), interroge Kraken
+  toutes les `POLL_SECONDS` (60s), gère deux « poches » de trading indépendantes (tendance +
+  scalp), et envoie des notifications Telegram à chaque trade / changement d'état.
+- **`backtest_on_railway.py`** — un script à exécution unique qui récupère l'historique des
+  bougies depuis Kraken, rejoue la même logique de stratégie, et envoie les résultats (résumé
+  texte + graphique de la courbe d'équité) sur Telegram. Conçu pour être lancé temporairement en
+  changeant la commande de démarrage sur Railway, puis remis en place ensuite.
 
-Code comments and log/Telegram messages are written in **French** — match that convention when
-editing existing strings or adding new ones in these files.
+Les commentaires de code ainsi que les messages de logs/Telegram sont écrits en **français** —
+respecte cette convention en modifiant les chaînes existantes ou en en ajoutant de nouvelles dans
+ces fichiers.
 
-## Running / developing
+## Développement / exécution
 
-There is no test suite, linter, or build step configured. Development is essentially: edit one
-of the two scripts, run it locally with the right env vars, watch the logs and/or Telegram
-output.
+Il n'y a ni suite de tests, ni linter, ni étape de build configurés. Le développement consiste
+essentiellement à : modifier l'un des deux scripts, l'exécuter en local avec les bonnes variables
+d'environnement, puis observer les logs et/ou la sortie Telegram.
 
 ```bash
 pip install -r requirements.txt   # ccxt, requests, matplotlib
 
-# Paper trading (default, no real orders, no API keys needed beyond Telegram):
+# Paper trading (mode par défaut, aucun ordre réel, pas besoin de clés API hormis Telegram) :
 python live_bot.py
 
-# Backtest (fetches BACKTEST_DAYS of 1m candles from Kraken and reports via Telegram):
+# Backtest (récupère BACKTEST_DAYS de bougies 1m depuis Kraken et envoie le résultat sur Telegram) :
 BACKTEST_DAYS=14 python backtest_on_railway.py
 ```
 
-Required environment variables (see the module docstring at the top of `live_bot.py`):
+Variables d'environnement nécessaires (voir le docstring en tête de `live_bot.py`) :
 
-| Variable | Purpose |
+| Variable | Rôle |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Notifications; bot logs a warning and no-ops if unset |
-| `TRADING_MODE` | `"paper"` (default) or `"live"` — see safety note below |
-| `ANTHROPIC_API_KEY` | Powers news-sentiment scoring via Claude (`live_bot.py` only) |
-| `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` | Only required when `TRADING_MODE=live` |
-| `STATE_FILE_PATH` / `TRADES_FILE_PATH` | Override defaults (`/data/state.json`, `/data/trades.json`) |
-| `BACKTEST_DAYS` | `backtest_on_railway.py` only, default 14 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Notifications ; le bot log un warning et ne fait rien si absentes |
+| `TRADING_MODE` | `"paper"` (défaut) ou `"live"` — voir la note de sécurité ci-dessous |
+| `ANTHROPIC_API_KEY` | Permet le scoring de sentiment des news via Claude (`live_bot.py` uniquement) |
+| `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` | Nécessaires uniquement si `TRADING_MODE=live` |
+| `STATE_FILE_PATH` / `TRADES_FILE_PATH` | Surcharge des chemins par défaut (`/data/state.json`, `/data/trades.json`) |
+| `BACKTEST_DAYS` | `backtest_on_railway.py` uniquement, défaut 14 |
 
-On Railway, `live_bot.py` needs a **Volume mounted at `/data`** so `state.json` and `trades.json`
-survive redeploys; without it the bot still runs but resets its position/history on every deploy.
+Sur Railway, `live_bot.py` a besoin d'un **Volume monté sur `/data`** pour que `state.json` et
+`trades.json` survivent aux redéploiements ; sans cela le bot fonctionne quand même mais perd sa
+position/son historique à chaque déploiement.
 
-### Trading mode safety
+### Sécurité du mode de trading
 
-Default mode is **paper trading** (simulated, no real money/orders). The module docstring in
-`live_bot.py` explicitly warns: never switch `TRADING_MODE=live` without having observed paper
-trading for at least several weeks first. When `TRADING_MODE=live`, Kraken API keys must have
-**trading-only permissions, never withdrawal**.
+Le mode par défaut est le **paper trading** (simulation, aucun ordre/argent réel). Le docstring
+du module dans `live_bot.py` prévient explicitement : ne jamais passer à `TRADING_MODE=live` sans
+avoir observé le bot tourner en paper trading pendant plusieurs semaines au minimum. En mode
+`TRADING_MODE=live`, les clés API Kraken doivent avoir **uniquement la permission de trading,
+jamais de retrait**.
 
 ## Architecture
 
-Both scripts implement the *same* strategy logic independently (there's no shared module) — when
-changing strategy parameters or logic, check whether the change should be mirrored in both
-`live_bot.py` and `backtest_on_railway.py` to keep backtests representative of live behavior.
+Les deux scripts implémentent la *même* logique de stratégie de façon indépendante (aucun module
+partagé) — en modifiant les paramètres ou la logique de la stratégie, vérifie s'il faut répercuter
+le changement dans `live_bot.py` **et** `backtest_on_railway.py` pour que les backtests restent
+représentatifs du comportement réel.
 
-### Two independent trading pockets
+### Deux poches de trading indépendantes
 
-Capital is split into two pockets that trade independently against the same `BTC/USD` 1-minute
-candles:
+Le capital est réparti en deux poches qui tradent indépendamment sur les mêmes bougies `BTC/USD`
+en 1 minute :
 
-- **Trend pocket** (`1 - SCALP_ALLOCATION_PCT` of capital, default 70%): MA10/MA25 crossover.
-  Long when `short_ma > long_ma`. Position size scales with trend strength between
-  `MIN_POSITION_PCT` and `MAX_POSITION_PCT` (`compute_position_pct`). Exits are checked in
-  priority order in `main_loop`: hard stop-loss (`TREND_STOP_LOSS_PCT`) → trailing stop
-  (`check_trailing_stop`, activates after `TRAILING_STOP_ACTIVATION_PCT` profit) → tiered ROI
-  target (`ROI_TABLE`, target decreases the longer the position is held) → MA cross-back signal.
-- **Scalp pocket** (`SCALP_ALLOCATION_PCT`, default 30%): momentum breakout. Enters when price
-  moves `SCALP_ENTRY_THRESHOLD_PCT` over `SCALP_MOMENTUM_WINDOW` minutes. Exits on take-profit,
-  stop-loss, or `SCALP_MAX_HOLD_MINUTES` timeout (`check_scalp_exit`).
+- **Poche tendance** (`1 - SCALP_ALLOCATION_PCT` du capital, 70% par défaut) : croisement de
+  moyennes mobiles MA10/MA25. Position longue quand `short_ma > long_ma`. La taille de position
+  varie entre `MIN_POSITION_PCT` et `MAX_POSITION_PCT` selon la force de la tendance
+  (`compute_position_pct`). Les sorties sont vérifiées par ordre de priorité dans `main_loop` :
+  stop-loss dur (`TREND_STOP_LOSS_PCT`) → stop-loss traînant (`check_trailing_stop`, s'active
+  après `TRAILING_STOP_ACTIVATION_PCT` de profit) → objectif ROI dégressif (`ROI_TABLE`, la cible
+  diminue plus la position est tenue longtemps) → signal de croisement inverse des MA.
+- **Poche scalp** (`SCALP_ALLOCATION_PCT`, 30% par défaut) : cassure de momentum. Entrée quand le
+  prix bouge de `SCALP_ENTRY_THRESHOLD_PCT` sur `SCALP_MOMENTUM_WINDOW` minutes. Sortie sur
+  take-profit, stop-loss, ou expiration après `SCALP_MAX_HOLD_MINUTES` (`check_scalp_exit`).
 
-### Live bot risk controls (`live_bot.py` only, not modeled in backtest)
+### Garde-fous du bot live (`live_bot.py` uniquement, non modélisés dans le backtest)
 
-- **Daily loss limit** — `DAILY_LOSS_LIMIT_PCT`: if today's total equity drops below this vs.
-  `day_start_equity`, `state.halted = True` and the bot stops trading until manual intervention.
-- **Volatility filter** — `MIN_VOLATILITY_PCT` blocks trend buys in flat/quiet markets.
-- **Trend-strength filter** — `MIN_TREND_STRENGTH_PCT` blocks trend buys on a near-zero MA cross
-  (noise). Both filter thresholds were tuned from observed live data — see inline comments near
-  their definitions for the reasoning/dates before changing them.
-- **Stoploss guard** (`is_stoploss_guard_active`) — pauses new trend buys for
-  `STOPLOSS_GUARD_PAUSE_MINUTES` after `STOPLOSS_GUARD_TRADE_LIMIT` stop-losses within
-  `STOPLOSS_GUARD_LOOKBACK_MINUTES`.
-- **Cooldown** (`is_in_cooldown`) — blocks new trend buys for `COOLDOWN_MINUTES` after any sell.
-- **News sentiment filter** — `fetch_news_sentiment` pulls BTC headlines from CryptoCompare,
-  scores them via a Claude API call (`analyze_sentiment_with_claude`, model
-  `claude-haiku-4-5-20251001`), and blocks new buys (both pockets) when the score is at/below
-  `NEWS_NEGATIVE_THRESHOLD`. Cached for `NEWS_REFRESH_SECONDS` (15 min). This filter is **not**
-  available in the backtest (no historical news archive), so backtest results are optimistic
-  relative to live behavior in that respect.
+- **Limite de perte journalière** — `DAILY_LOSS_LIMIT_PCT` : si l'équité totale du jour chute
+  sous ce seuil par rapport à `day_start_equity`, `state.halted = True` et le bot arrête de
+  trader jusqu'à intervention manuelle.
+- **Filtre de volatilité** — `MIN_VOLATILITY_PCT` bloque les achats tendance sur un marché
+  plat/calme.
+- **Filtre de force de tendance** — `MIN_TREND_STRENGTH_PCT` bloque les achats tendance sur un
+  croisement de MA quasi nul (bruit). Les deux seuils de filtre ont été ajustés à partir de
+  données réelles observées en live — voir les commentaires en ligne près de leur définition pour
+  le raisonnement/les dates avant de les modifier.
+- **Stoploss guard** (`is_stoploss_guard_active`) — met en pause les nouveaux achats tendance
+  pendant `STOPLOSS_GUARD_PAUSE_MINUTES` après `STOPLOSS_GUARD_TRADE_LIMIT` stop-loss survenus en
+  moins de `STOPLOSS_GUARD_LOOKBACK_MINUTES`.
+- **Cooldown** (`is_in_cooldown`) — bloque les nouveaux achats tendance pendant
+  `COOLDOWN_MINUTES` après toute vente.
+- **Filtre de sentiment news** — `fetch_news_sentiment` récupère des titres BTC depuis
+  CryptoCompare, les fait scorer via un appel à l'API Claude
+  (`analyze_sentiment_with_claude`, modèle `claude-haiku-4-5-20251001`), et bloque les nouveaux
+  achats (les deux poches) quand le score est inférieur ou égal à `NEWS_NEGATIVE_THRESHOLD`. Mis
+  en cache pendant `NEWS_REFRESH_SECONDS` (15 min). Ce filtre **n'est pas** disponible dans le
+  backtest (pas d'archive news historique disponible), donc les résultats du backtest sont
+  optimistes par rapport au comportement réel sur ce point.
 
-### State and persistence (`live_bot.py`)
+### État et persistance (`live_bot.py`)
 
-`BotState` holds cash/coin balances and position info for both pockets, loaded from
-`STATE_FILE_PATH` on startup and saved after every state-changing action via `state.save()`. All
-closed trades (both pockets) are appended to `TRADES_FILE_PATH` via `log_trade` (list capped at
-`MAX_TRADES_LOGGED`); this log is also read back by `is_stoploss_guard_active` and
-`compute_trade_stats` (win rate / avg PnL, reported in the periodic Telegram status message every
-`STATUS_EVERY_N_LOOPS` loops).
+`BotState` détient les soldes cash/coins et les infos de position des deux poches, chargés depuis
+`STATE_FILE_PATH` au démarrage et sauvegardés après chaque action modifiant l'état via
+`state.save()`. Chaque trade clôturé (les deux poches) est ajouté à `TRADES_FILE_PATH` via
+`log_trade` (liste plafonnée à `MAX_TRADES_LOGGED`) ; ce journal est aussi relu par
+`is_stoploss_guard_active` et par `compute_trade_stats` (taux de réussite / PnL moyen, reportés
+dans le message d'état Telegram périodique envoyé toutes les `STATUS_EVERY_N_LOOPS` boucles).
 
-### Backtest structure (`backtest_on_railway.py`)
+### Structure du backtest (`backtest_on_railway.py`)
 
-`fetch_history` paginates Kraken OHLCV via ccxt to build up to `BACKTEST_DAYS` of 1-minute
-candles. `run_backtest` replays the trend+scalp logic candle-by-candle over that data (no live
-risk controls, no news filter). `summarize_period` is run four times — full period, plus the
-data split into thirds (oldest/middle/newest) — to sanity-check whether the strategy holds up
-across different market phases rather than relying on one aggregate result. Results and an
-equity-curve chart (`plot_full_period`, saved to `/tmp` since Railway's filesystem is ephemeral
-outside `/data`) are sent to Telegram; nothing is written to disk persistently.
+`fetch_history` paginate les OHLCV Kraken via ccxt pour reconstituer jusqu'à `BACKTEST_DAYS` de
+bougies 1 minute. `run_backtest` rejoue la logique tendance+scalp bougie par bougie sur ces
+données (sans les garde-fous du live, sans filtre news). `summarize_period` est appelé quatre
+fois — période complète, plus les données découpées en trois tiers (le plus ancien / milieu / le
+plus récent) — pour vérifier si la stratégie tient dans différentes phases de marché plutôt que
+de se fier à un seul résultat agrégé. Les résultats et un graphique de la courbe d'équité
+(`plot_full_period`, sauvegardé dans `/tmp` car le système de fichiers de Railway est éphémère en
+dehors de `/data`) sont envoyés sur Telegram ; rien n'est écrit de façon persistante sur disque.
