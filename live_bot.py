@@ -42,8 +42,8 @@ log = logging.getLogger("trading-bot")
 # ============================================================
 SYMBOL = "BTC/USD"
 TIMEFRAME = "1m"
-SHORT_WINDOW = 30   # élargi le 27/07 (était 10) — lisse le bruit après diagnostic : trop de faux
-LONG_WINDOW = 75    # signaux sur des fenêtres courtes (33% puis 31% de réussite sur 52 trades)
+SHORT_WINDOW = 30
+LONG_WINDOW = 75
 VOLATILITY_WINDOW = 25  # séparée de LONG_WINDOW pour garder le seuil de volatilité calibré valide
 INITIAL_CAPITAL = 1000.0
 FEE_RATE = 0.001
@@ -73,10 +73,8 @@ STOPLOSS_GUARD_PAUSE_MINUTES = 120
 COOLDOWN_MINUTES = 15
 
 MIN_VOLATILITY_PCT = 0.15
-                              # (ajusté le 24/07 sur la base de relevés réels : ~0.21% en marché calme)
 
-MIN_TREND_STRENGTH_PCT = 0.05  # écart minimum MA30/MA75 requis pour agir — évite d'acheter sur un
-                                 # croisement quasi nul (bruit)
+MIN_TREND_STRENGTH_PCT = 0.05
 
 SCALP_ALLOCATION_PCT = 0.30
 SCALP_MOMENTUM_WINDOW = 5
@@ -153,9 +151,11 @@ def log_trade(pocket, side, price, amount, reason=None, pnl_pct=None):
     save_json_file(TRADES_FILE, trades)
 
 
-def compute_trade_stats():
+def compute_trade_stats(since_timestamp=None):
     trades = load_json_file(TRADES_FILE, [])
     sells = [t for t in trades if t["side"] == "sell" and t.get("pnl_pct") is not None]
+    if since_timestamp is not None:
+        sells = [t for t in sells if datetime.fromisoformat(t["time"]).timestamp() >= since_timestamp]
     if not sells:
         return None
 
@@ -262,6 +262,7 @@ class BotState:
 
 
 state = BotState()
+BOT_START_TIME = time.time()  # sert à isoler les stats "depuis ce déploiement" de l'historique complet
 
 
 def build_exchange():
@@ -698,19 +699,31 @@ def main_loop():
 
             if state.loop_count % STATUS_EVERY_N_LOOPS == 0:
                 pnl_pct = (current_total_equity / INITIAL_CAPITAL - 1) * 100
-                stats = compute_trade_stats()
-                if stats:
-                    def fmt(label, s):
-                        if not s:
-                            return f"{label} : aucun trade clôturé"
-                        return f"{label} : {s['total_trades']} trades, {s['win_rate']:.0f}% réussite, {s['avg_pnl_pct']:+.2f}% moy."
+                stats_all_time = compute_trade_stats()
+                stats_since_deploy = compute_trade_stats(since_timestamp=BOT_START_TIME)
+
+                def fmt(label, s):
+                    if not s:
+                        return f"{label} : aucun trade clôturé"
+                    return f"{label} : {s['total_trades']} trades, {s['win_rate']:.0f}% réussite, {s['avg_pnl_pct']:+.2f}% moy."
+
+                if stats_since_deploy:
+                    deploy_text = (
+                        f"\n\n📌 Depuis ce déploiement :"
+                        f"\n{fmt('Tendance', stats_since_deploy['trend'])}"
+                        f"\n{fmt('Scalp', stats_since_deploy['scalp'])}"
+                    )
+                else:
+                    deploy_text = "\n\n📌 Depuis ce déploiement : aucun trade clôturé pour l'instant"
+
+                if stats_all_time:
                     stats_text = (
-                        f"\n{fmt('Global', stats['overall'])}"
-                        f"\n{fmt('Tendance', stats['trend'])}"
-                        f"\n{fmt('Scalp', stats['scalp'])}"
+                        f"\n{fmt('Global (tout historique)', stats_all_time['overall'])}"
+                        f"{deploy_text}"
                     )
                 else:
                     stats_text = "\nHistorique : pas encore assez de trades clôturés"
+
                 send_telegram(
                     f"📊 État du bot\nPrix {SYMBOL} : {price:.2f}\n"
                     f"Position tendance : {'LONG' if state.position else 'CASH'}\n"
